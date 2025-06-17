@@ -1,0 +1,11 @@
+{
+    "parameterSets": {
+        "design default valuesFFFF": {
+            "profiler_length": "45",
+            "tube_lens_length": "50",
+            "tube_to_camera_flange": "148"
+        }
+    },
+    "parameterSets": "",
+    "fileFormatVersion": "1"
+}
