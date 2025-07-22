@@ -38,17 +38,29 @@ def get_positions_for_axes(port, axes):
             positions[axis] = 'NA'
     return positions
 
+def move_axis_to(ser, axis, pos):
+    try:
+        cmd = f'AXI{axis}:GOABS {int(round(float(pos)))}\r'
+        ser.write(cmd.encode('ascii'))
+        while True:
+            ser.write(f'AXI{axis}:MOTION?\r'.encode('ascii'))
+            resp = ser.readline().decode('ascii').strip()
+            if resp == '0':
+                break
+            time.sleep(0.05)
+    except Exception as e:
+        print(f"Error moving axis {axis}: {e}")
+
 class DualStageScanGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("DS102 Multi-Axis Scan & RayCi Image Capture")
-        self.geometry("1500x680")
+        self.geometry("1550x750")
         self.dut_axes = ['X', 'Y', 'Z', 'U', 'V', 'W']
         self.camera_axes = ['X', 'Y']
         self.entries = {}
         self.check_vars = {}
 
-        # Get initial origins
         self.dut_origin = get_positions_for_axes(DUT_SERIAL_PORT, self.dut_axes)
         self.camera_origin = get_positions_for_axes(CAMERA_SERIAL_PORT, self.camera_axes)
 
@@ -68,22 +80,20 @@ class DualStageScanGUI(tk.Tk):
             cb = tk.Checkbutton(self.dut_frame, variable=self.check_vars['DUT'][axis], bg="#ccc")
             cb.grid(row=i+1, column=1)
             self.entries['DUT'][axis] = {}
-            # Origin
             val = self.dut_origin[axis]
             ent = tk.Entry(self.dut_frame, width=9, fg="black", readonlybackground="#ccc")
             ent.grid(row=i+1, column=2)
             ent.insert(0, str(val))
             ent.config(state="readonly")
             self.entries['DUT'][axis]['origin'] = ent
-            # Start/Stop/Step
             for j, name in enumerate(['start', 'stop', 'step']):
                 ent2 = tk.Entry(self.dut_frame, width=9)
                 ent2.grid(row=i+1, column=3+j)
                 self.entries['DUT'][axis][name] = ent2
 
-        # --- Camera Umbrella Group ---
+        # --- Camera Umbrella Group (same layout as DUT) ---
         self.camera_frame = tk.LabelFrame(self, text="Camera (COM5)", font=("Arial", 13, "bold"), bg="#bbb", bd=3, relief="groove")
-        self.camera_frame.place(x=20, y=280, width=350, height=110)
+        self.camera_frame.place(x=20, y=280, width=480, height=120)
 
         for i, label in enumerate(header):
             tk.Label(self.camera_frame, text=label, font=('Arial', 10, 'bold'), bg="#bbb").grid(row=0, column=i, padx=5, pady=2)
@@ -107,7 +117,6 @@ class DualStageScanGUI(tk.Tk):
                 ent2.grid(row=i+1, column=3+j)
                 self.entries['CAMERA'][axis][name] = ent2
 
-        # --- Global Controls and Image/Progress (from previous code) ---
         self.unitset_btn = tk.Button(self, text="Unit Set", command=self.open_unitset)
         self.unitset_btn.place(x=60, y=550, width=120, height=36)
         self.start_btn = tk.Button(self, text="Start Scan", command=self.start_scan)
@@ -132,7 +141,109 @@ class DualStageScanGUI(tk.Tk):
             self.image_panel.configure(text="(Image failed to load)")
 
     def start_scan(self):
-        messagebox.showinfo("Info", "Scan logic for dual stages not yet implemented.")
+        # Determine which group to scan: only one group can have enabled axes
+        dut_enabled = any(self.check_vars['DUT'][ax].get() for ax in self.dut_axes)
+        cam_enabled = any(self.check_vars['CAMERA'][ax].get() for ax in self.camera_axes)
+        if dut_enabled and cam_enabled:
+            messagebox.showerror("Scan Error", "Please enable axes for ONLY ONE group (either DUT or Camera) at a time.")
+            return
+        if not dut_enabled and not cam_enabled:
+            messagebox.showwarning("No Axis Selected", "Please enable at least one axis in either group.")
+            return
+
+        if dut_enabled:
+            stage = 'DUT'
+            port = DUT_SERIAL_PORT
+            axes = self.dut_axes
+            origin = self.dut_origin
+        else:
+            stage = 'CAMERA'
+            port = CAMERA_SERIAL_PORT
+            axes = self.camera_axes
+            origin = self.camera_origin
+
+        # Read scan parameters for this stage
+        scan_params = {}
+        for ax in axes:
+            if self.check_vars[stage][ax].get():
+                try:
+                    start = float(self.entries[stage][ax]['start'].get())
+                    stop = float(self.entries[stage][ax]['stop'].get())
+                    step = int(float(self.entries[stage][ax]['step'].get()))
+                    if step < 2:
+                        messagebox.showerror("Input Error", f"Step (count) for {ax} must be integer ≥2.")
+                        return
+                    scan_params[ax] = np.linspace(start, stop, step)
+                except Exception:
+                    messagebox.showerror("Input Error", f"Invalid range/step for {ax}")
+                    return
+            else:
+                # Non-selected axis: fixed at origin
+                origin_val = origin[ax]
+                if origin_val == 'NA':
+                    messagebox.showerror("Axis Error", f"Origin value not available for {ax}")
+                    return
+                scan_params[ax] = np.array([float(origin_val)])
+
+        # Other stage: all axes fixed at origin
+        if stage == 'DUT':
+            other_axes = self.camera_axes
+            other_origin = self.camera_origin
+            other_port = CAMERA_SERIAL_PORT
+        else:
+            other_axes = self.dut_axes
+            other_origin = self.dut_origin
+            other_port = DUT_SERIAL_PORT
+
+        other_positions = {ax: float(other_origin[ax]) if other_origin[ax] != 'NA' else 0.0 for ax in other_axes}
+
+        # Cartesian product of all scan positions
+        grids = [scan_params[ax] for ax in axes]
+        positions = np.array(np.meshgrid(*grids, indexing='ij')).reshape(len(axes), -1).T
+
+        # Prepare log folder
+        log_root = os.path.join(os.getcwd(), "log")
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        log_dir = os.path.join(log_root, timestamp)
+        os.makedirs(log_dir, exist_ok=True)
+
+        # --- Connect serial for both stages
+        try:
+            ser1 = serial.Serial(port, baudrate=BAUDRATE, timeout=0.5)
+            ser2 = serial.Serial(other_port, baudrate=BAUDRATE, timeout=0.5)
+            # Save original positions for all axes, to return to origin
+            origin_pulses1 = {ax: float(origin[ax]) if origin[ax] != 'NA' else 0.0 for ax in axes}
+            origin_pulses2 = {ax: float(other_origin[ax]) if other_origin[ax] != 'NA' else 0.0 for ax in other_axes}
+            total = len(positions)
+            # -- Main scan loop
+            for idx, pos in enumerate(positions):
+                # Move scan axes (selected stage)
+                for ax, val in zip(axes, pos):
+                    move_axis_to(ser1, ax, val)
+                # Move other axes to their origin
+                for ax in other_axes:
+                    move_axis_to(ser2, ax, other_positions[ax])
+                # -- Save a dummy image (replace with real capture_bmp call as needed)
+                pos_strs = [f"{ax.lower()}_{int(round(val))}" for ax, val in zip(axes, pos)]
+                filename = os.path.join(log_dir, '_'.join(pos_strs) + '.bmp')
+                # Simulate by copying a reference image for demo:
+                # from shutil import copyfile; copyfile('ref.bmp', filename)
+                # For now just touch the file:
+                open(filename, 'ab').close()
+                self.progress_label.config(text=f"Iteration {idx+1} of {total}")
+                self.show_scan_image(filename)
+                self.update()
+
+            # Return all axes to original positions before closing
+            for ax in axes:
+                move_axis_to(ser1, ax, origin_pulses1[ax])
+            for ax in other_axes:
+                move_axis_to(ser2, ax, origin_pulses2[ax])
+            ser1.close()
+            ser2.close()
+            messagebox.showinfo("Scan Completed", "Scan complete and all axes returned to origin.")
+        except Exception as e:
+            messagebox.showerror("Serial Error", str(e))
 
 if __name__ == "__main__":
     app = DualStageScanGUI()
