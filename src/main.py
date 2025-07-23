@@ -6,10 +6,23 @@ import numpy as np
 import os
 import datetime
 from PIL import Image, ImageTk
+import xmlrpc.client
 
 DUT_SERIAL_PORT = 'COM3'
 CAMERA_SERIAL_PORT = 'COM5'
 BAUDRATE = 38400
+
+def get_rayci_proxy():
+    server_url = "http://localhost:8080/"
+    return xmlrpc.client.ServerProxy(server_url)
+
+def capture_bmp(rayci, filename):
+    try:
+        result = rayci.RayCi.LiveMode.Measurement.newSingle()
+        rayci.RayCi.LiveMode.TwoD.View.exportView(0, filename)
+        print(f"Saved image to {filename}")
+    except Exception as e:
+        print(f"RayCi image capture failed: {e}")
 
 def get_positions_for_axes(port, axes):
     positions = {}
@@ -141,7 +154,6 @@ class DualStageScanGUI(tk.Tk):
             self.image_panel.configure(text="(Image failed to load)")
 
     def start_scan(self):
-        # Determine which group to scan: only one group can have enabled axes
         dut_enabled = any(self.check_vars['DUT'][ax].get() for ax in self.dut_axes)
         cam_enabled = any(self.check_vars['CAMERA'][ax].get() for ax in self.camera_axes)
         if dut_enabled and cam_enabled:
@@ -156,13 +168,14 @@ class DualStageScanGUI(tk.Tk):
             port = DUT_SERIAL_PORT
             axes = self.dut_axes
             origin = self.dut_origin
+            log_group = "DUT"
         else:
             stage = 'CAMERA'
             port = CAMERA_SERIAL_PORT
             axes = self.camera_axes
             origin = self.camera_origin
+            log_group = "camera"
 
-        # Read scan parameters for this stage
         scan_params = {}
         for ax in axes:
             if self.check_vars[stage][ax].get():
@@ -178,14 +191,12 @@ class DualStageScanGUI(tk.Tk):
                     messagebox.showerror("Input Error", f"Invalid range/step for {ax}")
                     return
             else:
-                # Non-selected axis: fixed at origin
                 origin_val = origin[ax]
                 if origin_val == 'NA':
                     messagebox.showerror("Axis Error", f"Origin value not available for {ax}")
                     return
                 scan_params[ax] = np.array([float(origin_val)])
 
-        # Other stage: all axes fixed at origin
         if stage == 'DUT':
             other_axes = self.camera_axes
             other_origin = self.camera_origin
@@ -197,44 +208,42 @@ class DualStageScanGUI(tk.Tk):
 
         other_positions = {ax: float(other_origin[ax]) if other_origin[ax] != 'NA' else 0.0 for ax in other_axes}
 
-        # Cartesian product of all scan positions
-        grids = [scan_params[ax] for ax in axes]
-        positions = np.array(np.meshgrid(*grids, indexing='ij')).reshape(len(axes), -1).T
-
-        # Prepare log folder
-        log_root = os.path.join(os.getcwd(), "log")
+        log_root = os.path.join(os.getcwd(), "log", log_group)
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
         log_dir = os.path.join(log_root, timestamp)
         os.makedirs(log_dir, exist_ok=True)
 
-        # --- Connect serial for both stages
+        grids = [scan_params[ax] for ax in axes]
+        positions = np.array(np.meshgrid(*grids, indexing='ij')).reshape(len(axes), -1).T
+
         try:
             ser1 = serial.Serial(port, baudrate=BAUDRATE, timeout=0.5)
             ser2 = serial.Serial(other_port, baudrate=BAUDRATE, timeout=0.5)
-            # Save original positions for all axes, to return to origin
             origin_pulses1 = {ax: float(origin[ax]) if origin[ax] != 'NA' else 0.0 for ax in axes}
             origin_pulses2 = {ax: float(other_origin[ax]) if other_origin[ax] != 'NA' else 0.0 for ax in other_axes}
             total = len(positions)
-            # -- Main scan loop
+
+            rayci = get_rayci_proxy()
+
             for idx, pos in enumerate(positions):
-                # Move scan axes (selected stage)
                 for ax, val in zip(axes, pos):
                     move_axis_to(ser1, ax, val)
-                # Move other axes to their origin
                 for ax in other_axes:
                     move_axis_to(ser2, ax, other_positions[ax])
-                # -- Save a dummy image (replace with real capture_bmp call as needed)
+
                 pos_strs = [f"{ax.lower()}_{int(round(val))}" for ax, val in zip(axes, pos)]
                 filename = os.path.join(log_dir, '_'.join(pos_strs) + '.bmp')
-                # Simulate by copying a reference image for demo:
-                # from shutil import copyfile; copyfile('ref.bmp', filename)
-                # For now just touch the file:
-                open(filename, 'ab').close()
+
+                # Now: Real RayCi image saved for preview and disk!
+                if rayci:
+                    capture_bmp(rayci, filename)
+                else:
+                    self.progress_label.config(text="RayCi not available; skipping image capture.")
+
                 self.progress_label.config(text=f"Iteration {idx+1} of {total}")
                 self.show_scan_image(filename)
                 self.update()
 
-            # Return all axes to original positions before closing
             for ax in axes:
                 move_axis_to(ser1, ax, origin_pulses1[ax])
             for ax in other_axes:
